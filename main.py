@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 import asyncio
 import re
+import time
 from typing import Optional
 
 app = FastAPI(title="YouTube Media API", version="2.0.0")
@@ -23,6 +24,19 @@ ydl_opts = {
     "no_warnings": True,
     "extract_flat": False,
 }
+
+info_cache = {}
+CACHE_TTL = 600
+
+
+def get_cached(url: str, fetch_fn):
+    now = time.time()
+    cached = info_cache.get(url)
+    if cached and now - cached["time"] < CACHE_TTL:
+        return cached["data"]
+    data = fetch_fn()
+    info_cache[url] = {"data": data, "time": now}
+    return data
 
 
 def search_youtube(query: str, max_results: int = 10) -> list:
@@ -79,6 +93,32 @@ def get_video_info(url: str) -> dict:
                 if f.get("ext")
             ],
         }
+
+
+def get_best_stream_url(url: str) -> str:
+    opts = {
+        **ydl_opts,
+        "format": "best",
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        url = info.get("url")
+        if url:
+            return url
+        formats = info.get("formats") or []
+        best = None
+        for f in formats:
+            if f.get("vcodec") and f["vcodec"] != "none" and f.get("acodec") and f["acodec"] != "none" and f.get("url"):
+                height = parse_height(f.get("resolution", ""))
+                if best is None or height > best[0]:
+                    best = (height, f)
+        if best:
+            return best[1]["url"]
+        fallback = [f for f in formats if f.get("url")]
+        if fallback:
+            fallback.sort(key=lambda f: parse_height(f.get("resolution", "")), reverse=True)
+            return fallback[0]["url"]
+    raise HTTPException(status_code=404, detail="No playable format found")
 
 
 MUSIC_QUERY_PAGES = [
@@ -163,7 +203,7 @@ def extract_audio_formats(info: dict) -> list:
             "format_note": f.get("format_note"),
         }
         for f in (info.get("formats") or [])
-        if f.get("acodec") and f.get("acodec") != "none"
+        if f.get("acodec") and f["acodec"] != "none"
     ]
 
 
@@ -212,7 +252,7 @@ async def search(
 async def info(url: str = Query(..., description="YouTube video URL")):
     loop = asyncio.get_event_loop()
     try:
-        video_info = await loop.run_in_executor(None, get_video_info, url)
+        video_info = await loop.run_in_executor(None, lambda: get_cached(url, lambda: get_video_info(url)))
         return video_info
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -223,7 +263,7 @@ async def audio(url: str = Query(..., description="YouTube video URL")):
     loop = asyncio.get_event_loop()
     try:
         info = await loop.run_in_executor(
-            None, lambda: get_video_info(url)
+            None, lambda: get_cached(url, lambda: get_video_info(url))
         )
         audio_formats = extract_audio_formats(info)
         return {
@@ -252,22 +292,10 @@ def parse_height(resolution: str) -> int:
 async def stream(url: str = Query(..., description="YouTube video URL")):
     loop = asyncio.get_event_loop()
     try:
-        info = await loop.run_in_executor(None, lambda: get_video_info(url))
-        formats = info.get("formats", [])
-
-        usable = [f for f in formats if f.get("vcodec") and f["vcodec"] != "none" and f.get("acodec") and f["acodec"] != "none" and f.get("url")]
-
-        if usable:
-            usable.sort(key=lambda f: parse_height(f.get("resolution", "")), reverse=True)
-            best = usable[0]
-        else:
-            fallback = [f for f in formats if f.get("url")]
-            if not fallback:
-                raise HTTPException(status_code=404, detail="No playable format found")
-            fallback.sort(key=lambda f: parse_height(f.get("resolution", "")), reverse=True)
-            best = fallback[0]
-
-        return RedirectResponse(url=best["url"])
+        stream_url = await loop.run_in_executor(None, lambda: get_cached(url, lambda: get_best_stream_url(url)))
+        return RedirectResponse(url=stream_url)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
